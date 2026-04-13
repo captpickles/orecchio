@@ -1,0 +1,12 @@
+# Runtime dependencies for ear.py
+# Python: 3.12+
+# System dependency: ffmpeg (install via Homebrew on macOS)
+
+numpy==2.4.4
+pandas==3.0.2
+tensorflow==2.21.0
+tensorflow-hub==0.16.1
+tf_keras==2.21.0
+
+# tensorflow_hub currently imports pkg_resources; keep this pin for compatibility.
+setuptools<81
