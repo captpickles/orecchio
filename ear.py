@@ -9,6 +9,7 @@ import re
 import signal
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -22,6 +23,29 @@ import tensorflow_hub as hub
 YAMNET_HANDLE = "https://tfhub.dev/google/yamnet/1"
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # pcm_s16le
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    env: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        env[key] = value
+    return env
+
+
+def env_bool(value: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def utc_now() -> dt.datetime:
@@ -210,9 +234,9 @@ def build_rules() -> dict[str, EventRule]:
             name="bell",
             threshold=0.10,
             quiet_gap_seconds=10.0,
-            min_duration_seconds=4.0,
-            explicit_labels={"church bell", "bell", "tubular bells"},
-            contains_terms=("church bell", "bell", "tubular bells", "campanology", "change ringing"),
+            min_duration_seconds=2.0,
+            explicit_labels={"church bell", "tubular bells"},
+            contains_terms=("church bell", "tubular bells", "campanology", "change ringing"),
         ),
         "revving": EventRule(
             name="revving",
@@ -418,17 +442,112 @@ def notify_slack(url: str, event: dict, daily_count: int) -> None:
         print(f"[{iso(utc_now())}] slack webhook failed: {exc}", file=sys.stderr)
 
 
+def parse_firebase_conf(path: Path) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+
+    m = re.search(r"realtime\s*db\s*url\s*:\s*(https?://\S+)", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip().rstrip("/")
+
+    m = re.search(r'databaseURL"\s*:\s*"([^"]+)"', text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip().rstrip("/")
+
+    return ""
+
+
+def firebase_url(base_url: str, path: str, auth_token: str) -> str:
+    clean_base = base_url.rstrip("/")
+    parts = [urllib.parse.quote(part, safe="") for part in path.strip("/").split("/") if part]
+    full = f"{clean_base}/{'/'.join(parts)}.json"
+    if auth_token:
+        full = f"{full}?auth={urllib.parse.quote(auth_token, safe='')}"
+    return full
+
+
+def firebase_request(base_url: str, path: str, payload: dict, method: str, auth_token: str = "") -> None:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        firebase_url(base_url, path, auth_token),
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method=method,
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        resp.read()
+
+
+def notify_firebase(base_url: str, auth_token: str, event: dict, day_count: int, day_total_duration: float) -> None:
+    event_payload = {
+        "event_type": event["event_type"],
+        "start_utc": iso(event["start"]),
+        "end_utc": iso(event["end"]),
+        "duration_seconds": round(float(event["duration_seconds"]), 2),
+        "peak_score": round(float(event["peak_score"]), 4),
+        "hit_count": int(event["hit_count"]),
+        "matched_labels": list(event["matched_labels"]),
+        "date_utc": utc_day(event["start"]),
+        "event_count_for_day": int(day_count),
+        "total_duration_seconds_for_day": round(float(day_total_duration), 2),
+        "ingested_at_utc": iso(utc_now()),
+    }
+    firebase_request(base_url, "events", event_payload, method="POST", auth_token=auth_token)
+
+    daily_payload = {
+        "date_utc": utc_day(event["start"]),
+        "event_type": event["event_type"],
+        "event_count": int(day_count),
+        "total_duration_seconds": round(float(day_total_duration), 2),
+        "avg_duration_seconds": round(float(day_total_duration) / day_count, 2) if day_count else 0.0,
+        "updated_at_utc": iso(utc_now()),
+    }
+    firebase_request(
+        base_url,
+        f"daily_summary/{utc_day(event['start'])}/{event['event_type']}",
+        daily_payload,
+        method="PUT",
+        auth_token=auth_token,
+    )
+
+
 def main():
+    env = load_dotenv(Path(".env"))
+
     parser = argparse.ArgumentParser(description="RTSP audio nuisance-event logger using YAMNet")
-    parser.add_argument("--rtsp", required=True, help="RTSP URL")
-    parser.add_argument("--events-csv", default="events.csv")
-    parser.add_argument("--daily-csv", default="daily_summary.csv")
-    parser.add_argument("--chunk-seconds", type=float, default=5.0)
-    parser.add_argument("--dump-top", action="store_true")
-    parser.add_argument("--notify-webhook", default="", help="Optional webhook URL")
-    parser.add_argument("--slack-webhook", default="", help="Optional Slack Incoming Webhook URL")
+    parser.add_argument("--rtsp", default=env.get("ORECCHIO_RTSP", ""), help="RTSP URL")
+    parser.add_argument("--events-csv", default=env.get("ORECCHIO_EVENTS_CSV", "events.csv"))
+    parser.add_argument("--daily-csv", default=env.get("ORECCHIO_DAILY_CSV", "daily_summary.csv"))
+    parser.add_argument("--chunk-seconds", type=float, default=float(env.get("ORECCHIO_CHUNK_SECONDS", "5.0")))
+    parser.set_defaults(dump_top=env_bool(env.get("ORECCHIO_DUMP_TOP"), default=False))
+    parser.add_argument("--dump-top", dest="dump_top", action="store_true")
+    parser.add_argument("--no-dump-top", dest="dump_top", action="store_false")
+    parser.add_argument("--notify-webhook", default=env.get("ORECCHIO_NOTIFY_WEBHOOK", ""), help="Optional webhook URL")
+    parser.add_argument(
+        "--slack-webhook",
+        default=env.get("ORECCHIO_SLACK_WEBHOOK", ""),
+        help="Optional Slack Incoming Webhook URL",
+    )
+    parser.add_argument(
+        "--firebase-conf",
+        default=env.get("ORECCHIO_FIREBASE_CONF", ""),
+        help="Optional config file containing Realtime DB URL",
+    )
+    parser.add_argument(
+        "--firebase-db-url",
+        default=env.get("ORECCHIO_FIREBASE_DB_URL", ""),
+        help="Firebase Realtime Database URL",
+    )
+    parser.add_argument(
+        "--firebase-auth-token",
+        default=env.get("ORECCHIO_FIREBASE_AUTH_TOKEN", ""),
+        help="Optional Firebase RTDB auth token/secret",
+    )
 
     args = parser.parse_args()
+    if not args.rtsp:
+        raise ValueError("RTSP URL required. Set --rtsp or ORECCHIO_RTSP in .env")
     if args.chunk_seconds <= 0:
         raise ValueError("--chunk-seconds must be > 0")
 
@@ -445,6 +564,14 @@ def main():
     ensure_events_csv(events_csv)
     daily_summary = load_daily_summary(daily_csv)
     write_daily_summary(daily_csv, daily_summary)
+
+    firebase_db_url = args.firebase_db_url.strip().rstrip("/")
+    if not firebase_db_url:
+        conf_path = Path(args.firebase_conf) if args.firebase_conf else Path("firebase.conf")
+        firebase_db_url = parse_firebase_conf(conf_path)
+    firebase_enabled = bool(firebase_db_url)
+    if firebase_enabled:
+        print(f"[{iso(utc_now())}] firebase enabled: {firebase_db_url}")
 
     if ffmpeg.stdout is None:
         raise RuntimeError("ffmpeg stdout unavailable")
@@ -472,6 +599,18 @@ def main():
             if args.slack_webhook:
                 today_count = daily_summary[day][event["event_type"]]["event_count"]
                 notify_slack(args.slack_webhook, event, today_count)
+            if firebase_enabled:
+                try:
+                    stats = daily_summary[day][event["event_type"]]
+                    notify_firebase(
+                        firebase_db_url,
+                        args.firebase_auth_token,
+                        event,
+                        day_count=stats["event_count"],
+                        day_total_duration=stats["total_duration_seconds"],
+                    )
+                except Exception as exc:
+                    print(f"[{iso(utc_now())}] firebase write failed: {exc}", file=sys.stderr)
 
     def shutdown(*_):
         try:

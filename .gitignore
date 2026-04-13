@@ -27,3 +27,6 @@ htmlcov/
 .ruff_cache/
 
 *.csv
+
+firebase.conf
+.env
