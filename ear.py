@@ -19,6 +19,14 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 import tensorflow_hub as hub
+try:
+    import firebase_admin
+    from firebase_admin import credentials as firebase_credentials
+    from firebase_admin import db as firebase_db
+except Exception:  # Optional dependency; only needed when Firebase Admin is enabled.
+    firebase_admin = None
+    firebase_credentials = None
+    firebase_db = None
 
 YAMNET_HANDLE = "https://tfhub.dev/google/yamnet/1"
 SAMPLE_RATE = 16000
@@ -226,17 +234,17 @@ def build_rules() -> dict[str, EventRule]:
             name="mower",
             threshold=0.08,
             quiet_gap_seconds=20.0,
-            min_duration_seconds=30.0,
+            min_duration_seconds=360.0,
             explicit_labels={"lawn mower"},
             contains_terms=("heavy engine", "medium engine", "idling"),
         ),
         "bell": EventRule(
             name="bell",
-            threshold=0.10,
+            threshold=0.25,
             quiet_gap_seconds=10.0,
-            min_duration_seconds=2.0,
-            explicit_labels={"church bell", "tubular bells"},
-            contains_terms=("church bell", "tubular bells", "campanology", "change ringing"),
+            min_duration_seconds=4.0,
+            explicit_labels={"tubular bells"},
+            contains_terms=("tubular bells", "bell", "campanology", "change ringing"),
         ),
         "revving": EventRule(
             name="revving",
@@ -258,11 +266,38 @@ def build_rules() -> dict[str, EventRule]:
             name="train_horn",
             threshold=0.35,
             quiet_gap_seconds=10.0,
-            min_duration_seconds=1.0,
+            min_duration_seconds=5.0,
             max_duration_seconds=30.0,
             explicit_labels={"train horn", "train whistle"},
             contains_terms=("train horn", "train whistle"),
         ),
+        "gunfire": EventRule(
+            name="gunfire",
+            threshold=0.20,
+            quiet_gap_seconds=3.0,
+            min_duration_seconds=0.5,
+            max_duration_seconds=12.0,
+            explicit_labels={"gunshot, gunfire"},
+            contains_terms=("gunshot", "gunfire"),
+        ),
+        #"fireworks": EventRule(
+            #name="fireworks",
+            #threshold=0.20,
+            #quiet_gap_seconds=6.0,
+            #min_duration_seconds=0.5,
+            #max_duration_seconds=20.0,
+            #explicit_labels={"fireworks", "firecracker"},
+            #contains_terms=("firework", "firecracker", "rocket"),
+        #),
+        #"explosion": EventRule(
+            #name="explosion",
+            #threshold=0.22,
+            #quiet_gap_seconds=5.0,
+            #min_duration_seconds=0.5,
+            #max_duration_seconds=20.0,
+            #explicit_labels={"explosion", "burst, pop", "boom"},
+            #contains_terms=("explosion", "burst", "pop", "boom"),
+        #),
         # Optional, still fuzzy:
         # "blower": EventRule(
         #     name="blower",
@@ -442,22 +477,6 @@ def notify_slack(url: str, event: dict, daily_count: int) -> None:
         print(f"[{iso(utc_now())}] slack webhook failed: {exc}", file=sys.stderr)
 
 
-def parse_firebase_conf(path: Path) -> str:
-    if not path.exists():
-        return ""
-    text = path.read_text(encoding="utf-8", errors="ignore")
-
-    m = re.search(r"realtime\s*db\s*url\s*:\s*(https?://\S+)", text, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip().rstrip("/")
-
-    m = re.search(r'databaseURL"\s*:\s*"([^"]+)"', text, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip().rstrip("/")
-
-    return ""
-
-
 def firebase_url(base_url: str, path: str, auth_token: str) -> str:
     clean_base = base_url.rstrip("/")
     parts = [urllib.parse.quote(part, safe="") for part in path.strip("/").split("/") if part]
@@ -512,6 +531,60 @@ def notify_firebase(base_url: str, auth_token: str, event: dict, day_count: int,
     )
 
 
+class FirebaseAdminWriter:
+    def __init__(self, service_account_path: Path, db_url: str):
+        if firebase_admin is None or firebase_credentials is None or firebase_db is None:
+            raise RuntimeError("firebase-admin is not installed. Run: pip install firebase-admin")
+        if not service_account_path.exists():
+            raise RuntimeError(f"Firebase service account file not found: {service_account_path}")
+        if not db_url:
+            raise RuntimeError("Firebase Realtime DB URL required for Admin SDK writes")
+
+        app_name = f"orecchio-{service_account_path.resolve()}"
+        app = None
+        for existing in firebase_admin._apps.values():
+            if existing.name == app_name:
+                app = existing
+                break
+        if app is None:
+            cred = firebase_credentials.Certificate(str(service_account_path))
+            app = firebase_admin.initialize_app(
+                cred,
+                {"databaseURL": db_url},
+                name=app_name,
+            )
+        self.app = app
+
+    def write_event(self, event: dict, day_count: int, day_total_duration: float) -> None:
+        event_payload = {
+            "event_type": event["event_type"],
+            "start_utc": iso(event["start"]),
+            "end_utc": iso(event["end"]),
+            "duration_seconds": round(float(event["duration_seconds"]), 2),
+            "peak_score": round(float(event["peak_score"]), 4),
+            "hit_count": int(event["hit_count"]),
+            "matched_labels": list(event["matched_labels"]),
+            "date_utc": utc_day(event["start"]),
+            "event_count_for_day": int(day_count),
+            "total_duration_seconds_for_day": round(float(day_total_duration), 2),
+            "ingested_at_utc": iso(utc_now()),
+        }
+        firebase_db.reference("events", app=self.app).push(event_payload)
+
+        daily_payload = {
+            "date_utc": utc_day(event["start"]),
+            "event_type": event["event_type"],
+            "event_count": int(day_count),
+            "total_duration_seconds": round(float(day_total_duration), 2),
+            "avg_duration_seconds": round(float(day_total_duration) / day_count, 2) if day_count else 0.0,
+            "updated_at_utc": iso(utc_now()),
+        }
+        firebase_db.reference(
+            f"daily_summary/{utc_day(event['start'])}/{event['event_type']}",
+            app=self.app,
+        ).set(daily_payload)
+
+
 def main():
     env = load_dotenv(Path(".env"))
 
@@ -530,11 +603,6 @@ def main():
         help="Optional Slack Incoming Webhook URL",
     )
     parser.add_argument(
-        "--firebase-conf",
-        default=env.get("ORECCHIO_FIREBASE_CONF", ""),
-        help="Optional config file containing Realtime DB URL",
-    )
-    parser.add_argument(
         "--firebase-db-url",
         default=env.get("ORECCHIO_FIREBASE_DB_URL", ""),
         help="Firebase Realtime Database URL",
@@ -543,6 +611,11 @@ def main():
         "--firebase-auth-token",
         default=env.get("ORECCHIO_FIREBASE_AUTH_TOKEN", ""),
         help="Optional Firebase RTDB auth token/secret",
+    )
+    parser.add_argument(
+        "--firebase-service-account",
+        default=env.get("ORECCHIO_FIREBASE_SERVICE_ACCOUNT", ""),
+        help="Optional path to Firebase service account JSON for Admin SDK writes",
     )
 
     args = parser.parse_args()
@@ -566,12 +639,18 @@ def main():
     write_daily_summary(daily_csv, daily_summary)
 
     firebase_db_url = args.firebase_db_url.strip().rstrip("/")
-    if not firebase_db_url:
-        conf_path = Path(args.firebase_conf) if args.firebase_conf else Path("firebase.conf")
-        firebase_db_url = parse_firebase_conf(conf_path)
     firebase_enabled = bool(firebase_db_url)
+    firebase_admin_writer = None
+    firebase_service_account = args.firebase_service_account.strip()
+    if firebase_service_account:
+        try:
+            firebase_admin_writer = FirebaseAdminWriter(Path(firebase_service_account), firebase_db_url)
+            firebase_enabled = True
+        except Exception as exc:
+            print(f"[{iso(utc_now())}] firebase admin init failed: {exc}", file=sys.stderr)
     if firebase_enabled:
-        print(f"[{iso(utc_now())}] firebase enabled: {firebase_db_url}")
+        mode = "admin-sdk" if firebase_admin_writer is not None else "rest"
+        print(f"[{iso(utc_now())}] firebase enabled ({mode}): {firebase_db_url}")
 
     if ffmpeg.stdout is None:
         raise RuntimeError("ffmpeg stdout unavailable")
@@ -602,13 +681,20 @@ def main():
             if firebase_enabled:
                 try:
                     stats = daily_summary[day][event["event_type"]]
-                    notify_firebase(
-                        firebase_db_url,
-                        args.firebase_auth_token,
-                        event,
-                        day_count=stats["event_count"],
-                        day_total_duration=stats["total_duration_seconds"],
-                    )
+                    if firebase_admin_writer is not None:
+                        firebase_admin_writer.write_event(
+                            event,
+                            day_count=stats["event_count"],
+                            day_total_duration=stats["total_duration_seconds"],
+                        )
+                    else:
+                        notify_firebase(
+                            firebase_db_url,
+                            args.firebase_auth_token,
+                            event,
+                            day_count=stats["event_count"],
+                            day_total_duration=stats["total_duration_seconds"],
+                        )
                 except Exception as exc:
                     print(f"[{iso(utc_now())}] firebase write failed: {exc}", file=sys.stderr)
 

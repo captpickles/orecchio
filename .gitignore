@@ -29,4 +29,5 @@ htmlcov/
 *.csv
 
 firebase.conf
+firebase-account.json
 .env

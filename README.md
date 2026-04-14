@@ -71,10 +71,19 @@ With Firebase Realtime Database (optional):
   --events-csv events.csv \
   --daily-csv daily_summary.csv \
   --chunk-seconds 2 \
-  --firebase-conf firebase.conf
+  --firebase-db-url 'https://<project>-default-rtdb.firebaseio.com'
 ```
 
-Or explicit DB URL/token:
+Recommended unattended auth (service account):
+
+```bash
+.venv/bin/python ear.py \
+  --rtsp 'rtsps://<camera-ip>:7441/<stream-token>?enableSrtp' \
+  --firebase-db-url 'https://<project>-default-rtdb.firebaseio.com' \
+  --firebase-service-account '/absolute/path/to/service-account.json'
+```
+
+REST fallback (token-based):
 
 ```bash
 .venv/bin/python ear.py \
@@ -117,12 +126,17 @@ ffmpeg -hide_banner -loglevel error \
 
 ## Firebase notes
 
-`ear.py` can write to Firebase Realtime DB via REST:
+`ear.py` can write to Firebase Realtime DB:
 
-- `POST /events`
-- `PUT /daily_summary/<date_utc>/<event_type>`
+- Admin SDK (preferred): service account JSON + DB URL
+- REST fallback: DB URL + auth token (if required)
 
-If you get `HTTP 401 Unauthorized`, your DB rules/token are not set for this writer yet.
+Writes:
+
+- `events` (append)
+- `daily_summary/<date_utc>/<event_type>` (upsert)
+
+If you get `HTTP 401 Unauthorized`, your rules/auth are still blocking writes.
 
 For quick local testing only, you can temporarily relax rules in Realtime Database Rules:
 
@@ -135,4 +149,4 @@ For quick local testing only, you can temporarily relax rules in Realtime Databa
 }
 ```
 
-Do not leave open rules in production. Prefer authenticated writes (`--firebase-auth-token`) with restrictive rules.
+Do not leave open rules in production. Prefer service-account writes (`--firebase-service-account`) with restrictive rules.
