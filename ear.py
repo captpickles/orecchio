@@ -12,6 +12,7 @@ import sys
 import urllib.parse
 import urllib.request
 from collections import defaultdict
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,6 +69,17 @@ def utc_day(ts: dt.datetime) -> str:
     return ts.strftime("%Y-%m-%d")
 
 
+def configure_stdio() -> None:
+    # Ensure timely log streaming even when stdout/stderr are piped (e.g., through tee).
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(line_buffering=True, write_through=True)
+
+
 @dataclass
 class EventRule:
     name: str
@@ -87,6 +99,58 @@ class ActiveEvent:
     peak_score: float
     matched_labels: set[str] = field(default_factory=set)
     hit_count: int = 1
+
+
+class RollingRatioDetector:
+    def __init__(
+        self,
+        *,
+        label_name: str,
+        hit_threshold: float,
+        window_seconds: float,
+        min_ratio_to_open: float,
+        min_ratio_to_stay_open: float,
+        chunk_seconds: float,
+    ):
+        self.label_name = label_name.lower()
+        self.hit_threshold = hit_threshold
+        self.window_seconds = window_seconds
+        self.min_ratio_to_open = min_ratio_to_open
+        self.min_ratio_to_stay_open = min_ratio_to_stay_open
+        self.chunk_seconds = chunk_seconds
+        self.samples: deque[tuple[dt.datetime, bool, float]] = deque()
+        self.active = False
+
+    def _trim(self, ts: dt.datetime) -> None:
+        cutoff = ts - dt.timedelta(seconds=self.window_seconds)
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
+
+    def _has_full_window(self) -> bool:
+        if len(self.samples) < 2:
+            return False
+        span = (self.samples[-1][0] - self.samples[0][0]).total_seconds() + self.chunk_seconds
+        return span >= self.window_seconds
+
+    def observe(self, ts: dt.datetime, top_labels: list[tuple[str, float]]) -> tuple[bool, float]:
+        score_by_label = {label.lower(): score for label, score in top_labels}
+        score = score_by_label.get(self.label_name, 0.0)
+        is_hit = score >= self.hit_threshold
+
+        self.samples.append((ts, is_hit, score))
+        self._trim(ts)
+
+        if self.samples and self._has_full_window():
+            hit_count = sum(1 for _, hit, _ in self.samples if hit)
+            ratio = hit_count / len(self.samples)
+            if not self.active and ratio >= self.min_ratio_to_open:
+                self.active = True
+            elif self.active and ratio < self.min_ratio_to_stay_open:
+                self.active = False
+        else:
+            ratio = 0.0
+
+        return self.active, score
 
 
 class EventTracker:
@@ -248,9 +312,9 @@ def build_rules() -> dict[str, EventRule]:
         ),
         "revving": EventRule(
             name="revving",
-            threshold=0.12,
+            threshold=0.20,
             quiet_gap_seconds=3.0,
-            min_duration_seconds=2.0,
+            min_duration_seconds=4.0,
             max_duration_seconds=20.0,
             explicit_labels={"accelerating, revving, vroom"},
             contains_terms=("revving", "accelerating", "vroom"),
@@ -306,6 +370,19 @@ def build_rules() -> dict[str, EventRule]:
         #     min_duration_seconds=10.0,
         #     contains_terms=("blower", "power tool", "vacuum cleaner"),
         # ),
+    }
+
+
+def build_regimes(chunk_seconds: float) -> dict[str, RollingRatioDetector]:
+    return {
+        "mower": RollingRatioDetector(
+            label_name="vehicle",
+            hit_threshold=0.20,
+            window_seconds=600.0,
+            min_ratio_to_open=0.80,
+            min_ratio_to_stay_open=0.70,
+            chunk_seconds=chunk_seconds,
+        ),
     }
 
 
@@ -586,6 +663,7 @@ class FirebaseAdminWriter:
 
 
 def main():
+    configure_stdio()
     env = load_dotenv(Path(".env"))
 
     parser = argparse.ArgumentParser(description="RTSP audio nuisance-event logger using YAMNet")
@@ -628,6 +706,7 @@ def main():
     chunk_bytes = chunk_samples * BYTES_PER_SAMPLE
 
     rules = build_rules()
+    regimes = build_regimes(args.chunk_seconds)
     tracker = EventTracker(rules, chunk_seconds=args.chunk_seconds)
 
     model, class_names = load_yamnet()
@@ -745,9 +824,26 @@ def main():
                 pretty = ", ".join(f"{label}={score:.3f}" for label, score in top)
                 print(f"[{iso(ts)}] top: {pretty}")
 
+            regime_states: dict[str, tuple[bool, float, str]] = {}
+            for event_type, detector in regimes.items():
+                active, score = detector.observe(ts, top)
+                label = (
+                    f"{detector.label_name}>={detector.hit_threshold:.2f} "
+                    f"(rolling {int(round(detector.window_seconds / 60.0))}m ratio)"
+                )
+                regime_states[event_type] = (active, score, label)
+
             matches = classify(top, rules)
+            mower_active = regime_states.get("mower", (False, 0.0, ""))[0]
             for event_type, matched_label, score in matches:
+                if event_type == "revving" and mower_active:
+                    continue
                 tracker.update(event_type, matched_label, score, ts)
+
+            for event_type, (active, score, label) in regime_states.items():
+                if not active:
+                    continue
+                tracker.update(event_type, label, score, ts)
 
             persist(tracker.flush_finished(ts))
 
