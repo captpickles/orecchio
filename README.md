@@ -1,152 +1,116 @@
 
-# orecch.io baseline detector
+# orecchio
 
-Small local baseline for passive acoustic event detection from a UniFi camera stream.
+Audio ingest platform for environmental event detection.
 
-## What it does
+`ear.py` is legacy and unchanged.  
+`orecchio.py` is the active platform entrypoint.
 
-- Reads audio from RTSP/RTSPS via `ffmpeg`
-- Resamples to mono 16 kHz PCM
-- Runs YAMNet on fixed chunks
-- Aggregates chunk labels into higher-level events
-- Writes:
-- `events.csv`
-- `daily_summary.csv`
-- Optionally sends one-line Slack notifications per closed event
+## What `orecchio.py` does
 
-## Prerequisites
+- Ingests audio from `avfoundation` or `rtsp/rtsps` via `ffmpeg`
+- Fans out one stream to multiple branches
+- Runs:
+  - `yamnet` event detection
+  - `birdnet` detections
+- Writes local outputs:
+  - `orecchio_events.csv`
+  - `orecchio_daily_summary.csv`
+  - `orecchio_detections.jsonl`
+- Optional Firebase writes under site namespace:
+  - `orecchio_sites/<site_id>/events`
+  - `orecchio_sites/<site_id>/daily_summary`
+  - `orecchio_sites/<site_id>/birds`
 
-- macOS (or Linux)
-- Python 3.12+
-- `ffmpeg` installed (macOS: `brew install ffmpeg`)
-
-## Local setup
+## Setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp orecchio.toml.example orecchio.toml
 ```
-
-Do not commit `.venv` (already ignored in `.gitignore`).
-
-You can also put defaults in `.env` (already gitignored), then run with fewer flags.
 
 ## Run
 
-Shortest run (uses `.env` defaults):
+```bash
+.venv/bin/python orecchio.py
+```
+
+`orecchio.py` reads `orecchio.toml` by default.
+
+## Config
+
+Main config file: `orecchio.toml`  
+Example: `orecchio.toml.example`
+
+Required minimum:
+- `site.id`
+- `source.provider`
+- if `provider = "avfoundation"`: `source.device`
+- if `provider = "rtsp"`: `source.rtsp_url`
+
+## Firebase auth modes
+
+In `[outputs.firebase]`, choose one mode:
+
+1. Admin SDK (trusted, bypasses RTDB rules):
+- `service_account`
+
+2. REST static token:
+- `auth_token`
+
+3. REST refresh-token mode (recommended for friend installs):
+- `api_key`
+- `refresh_token`
+- optional `id_token`
+
+If Firebase is enabled and auth is incomplete, `python orecchio.py` now prompts for Firebase login and writes refresh auth fields back to `orecchio.toml`.
+
+Manual token bootstrap command:
 
 ```bash
-.venv/bin/python ear.py
+.venv/bin/python orecchio.py login \
+  --firebase-api-key 'YOUR_API_KEY' \
+  --firebase-email 'user@example.com' \
+  --firebase-password 'password'
 ```
 
-CLI flags override `.env` values when provided.
+## RTDB rules for per-site writes (UID allowlist)
+
+Use rules that gate writes by:
+- `site_writers/<site_id>/<auth.uid> == true`
+
+Set allowlist entries with:
 
 ```bash
-.venv/bin/python ear.py \
-  --rtsp 'rtsps://<camera-ip>:7441/<stream-token>?enableSrtp' \
-  --events-csv events.csv \
-  --daily-csv daily_summary.csv \
-  --chunk-seconds 2 \
-  --dump-top
+.venv/bin/python scripts/site_writer_auth.py \
+  --service-account /path/to/firebase-account.json \
+  --db-url https://<project>-default-rtdb.firebaseio.com \
+  --site-id wytheville-01 \
+  --uid FIREBASE_UID_HERE
 ```
 
-With Slack:
+## eBird taxonomy
 
-```bash
-.venv/bin/python ear.py \
-  --rtsp 'rtsps://<camera-ip>:7441/<stream-token>?enableSrtp' \
-  --events-csv events.csv \
-  --daily-csv daily_summary.csv \
-  --chunk-seconds 2 \
-  --slack-webhook 'https://hooks.slack.com/services/...' \
-  --dump-top
-```
+Bird detections include `ebird_species_code` using:
+- direct BirdNET fields when available
+- fallback mapping from `branches.birdnet.ebird_taxonomy_csv` (official eBird taxonomy CSV)
 
-With Firebase Realtime Database (optional):
+Default config path:
+- `ebird_taxonomy_csv = "ebird_taxonomy.csv"`
 
-```bash
-.venv/bin/python ear.py \
-  --rtsp 'rtsps://<camera-ip>:7441/<stream-token>?enableSrtp' \
-  --events-csv events.csv \
-  --daily-csv daily_summary.csv \
-  --chunk-seconds 2 \
-  --firebase-db-url 'https://<project>-default-rtdb.firebaseio.com'
-```
+## Docker
 
-Recommended unattended auth (service account):
+`Dockerfile` is included.
 
-```bash
-.venv/bin/python ear.py \
-  --rtsp 'rtsps://<camera-ip>:7441/<stream-token>?enableSrtp' \
-  --firebase-db-url 'https://<project>-default-rtdb.firebaseio.com' \
-  --firebase-service-account '/absolute/path/to/service-account.json'
-```
+Recommended for friend deployments:
+- mount `orecchio.toml` as `rw` for first auth bootstrap
+- mount output data directory for persistence
+- after bootstrap, config mount can be switched to `ro` if desired
 
-REST fallback (token-based):
+## Additional docs
 
-```bash
-.venv/bin/python ear.py \
-  --rtsp 'rtsps://<camera-ip>:7441/<stream-token>?enableSrtp' \
-  --firebase-db-url 'https://<project>-default-rtdb.firebaseio.com' \
-  --firebase-auth-token '<TOKEN_IF_REQUIRED>'
-```
-
-## Output files
-
-- `events.csv`: one row per closed event
-- `daily_summary.csv`: per-day per-event counts and durations
-
-## UniFi camera RTSP/RTSPS setup (suggested)
-
-UI labels vary by UniFi Protect version, but the flow is usually:
-
-1. Open UniFi Protect.
-2. Select camera.
-3. Find stream settings / advanced settings.
-4. Enable RTSP or RTSPS stream.
-5. Copy the generated stream URL/token.
-
-Notes:
-
-- Prefer `rtsps://` when available.
-- Keep camera and detector on the same LAN/VPN.
-- Verify audio exists before tuning detection:
-- Record a short clip with `ffmpeg`.
-- Listen to confirm your target sounds are actually present.
-
-Quick audio check:
-
-```bash
-ffmpeg -hide_banner -loglevel error \
-  -rtsp_transport tcp \
-  -i 'rtsps://<camera-ip>:7441/<stream-token>?enableSrtp' \
-  -t 20 -vn -ac 1 -ar 16000 -c:a pcm_s16le check.wav
-```
-
-## Firebase notes
-
-`ear.py` can write to Firebase Realtime DB:
-
-- Admin SDK (preferred): service account JSON + DB URL
-- REST fallback: DB URL + auth token (if required)
-
-Writes:
-
-- `events` (append)
-- `daily_summary/<date_utc>/<event_type>` (upsert)
-
-If you get `HTTP 401 Unauthorized`, your rules/auth are still blocking writes.
-
-For quick local testing only, you can temporarily relax rules in Realtime Database Rules:
-
-```json
-{
-  "rules": {
-    ".read": true,
-    ".write": true
-  }
-}
-```
-
-Do not leave open rules in production. Prefer service-account writes (`--firebase-service-account`) with restrictive rules.
+- `ORECCHIO_CONFIG.md` — config contract and auth modes
+- `ORECCHIO_RUNBOOK.md` — shadow/cutover/rollback steps
+- `UI_HANDOFF.md` — dashboard schema/path handoff

@@ -51,10 +51,13 @@ detections_jsonl = "orecchio_detections.jsonl"
 [outputs.firebase]
 enabled = false
 db_url = ""
+# auth mode 1 (REST static token)
 auth_token = ""
+# auth mode 2 (REST refresh-token; recommended for shared Firebase + per-site rules)
 api_key = ""
 refresh_token = ""
 id_token = ""
+# auth mode 3 (Admin SDK; bypasses RTDB rules)
 service_account = ""
 base_path = "orecchio_sites"
 
