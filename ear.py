@@ -9,6 +9,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -266,6 +267,28 @@ def start_ffmpeg(rtsp_url: str) -> subprocess.Popen:
     )
 
 
+def stop_ffmpeg(proc: subprocess.Popen | None) -> None:
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=2.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def read_ffmpeg_stderr(proc: subprocess.Popen | None) -> str:
+    if proc is None or proc.stderr is None:
+        return ""
+    try:
+        return proc.stderr.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
 def pcm16_to_float(raw: bytes) -> np.ndarray:
     arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
     if arr.size == 0:
@@ -335,15 +358,15 @@ def build_rules() -> dict[str, EventRule]:
             explicit_labels={"train horn", "train whistle"},
             contains_terms=("train horn", "train whistle"),
         ),
-        "gunfire": EventRule(
-            name="gunfire",
-            threshold=0.20,
-            quiet_gap_seconds=3.0,
-            min_duration_seconds=0.5,
-            max_duration_seconds=12.0,
-            explicit_labels={"gunshot, gunfire"},
-            contains_terms=("gunshot", "gunfire"),
-        ),
+        #"gunfire": EventRule(
+        #    name="gunfire",
+        #    threshold=0.20,
+        #    quiet_gap_seconds=3.0,
+        #    min_duration_seconds=0.5,
+        #    max_duration_seconds=12.0,
+        #    explicit_labels={"gunshot, gunfire"},
+        #    contains_terms=("gunshot", "gunfire"),
+        #),
         #"fireworks": EventRule(
             #name="fireworks",
             #threshold=0.20,
@@ -671,6 +694,11 @@ def main():
     parser.add_argument("--events-csv", default=env.get("ORECCHIO_EVENTS_CSV", "events.csv"))
     parser.add_argument("--daily-csv", default=env.get("ORECCHIO_DAILY_CSV", "daily_summary.csv"))
     parser.add_argument("--chunk-seconds", type=float, default=float(env.get("ORECCHIO_CHUNK_SECONDS", "5.0")))
+    parser.add_argument(
+        "--reconnect-delay-seconds",
+        type=float,
+        default=float(env.get("ORECCHIO_RECONNECT_DELAY_SECONDS", "3.0")),
+    )
     parser.set_defaults(dump_top=env_bool(env.get("ORECCHIO_DUMP_TOP"), default=False))
     parser.add_argument("--dump-top", dest="dump_top", action="store_true")
     parser.add_argument("--no-dump-top", dest="dump_top", action="store_false")
@@ -701,6 +729,8 @@ def main():
         raise ValueError("RTSP URL required. Set --rtsp or ORECCHIO_RTSP in .env")
     if args.chunk_seconds <= 0:
         raise ValueError("--chunk-seconds must be > 0")
+    if args.reconnect_delay_seconds <= 0:
+        raise ValueError("--reconnect-delay-seconds must be > 0")
 
     chunk_samples = int(SAMPLE_RATE * args.chunk_seconds)
     chunk_bytes = chunk_samples * BYTES_PER_SAMPLE
@@ -781,10 +811,7 @@ def main():
         try:
             persist(tracker.flush_all())
         finally:
-            try:
-                ffmpeg.terminate()
-            except Exception:
-                pass
+            stop_ffmpeg(ffmpeg)
             sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
@@ -799,13 +826,21 @@ def main():
             raw = ffmpeg.stdout.read(chunk_bytes - len(pending))
             if not raw:
                 persist(tracker.flush_all())
-                err = ""
-                if ffmpeg.stderr is not None:
-                    try:
-                        err = ffmpeg.stderr.read().decode("utf-8", errors="ignore")
-                    except Exception:
-                        pass
-                raise RuntimeError(f"ffmpeg stream ended. stderr:\n{err}")
+                err = read_ffmpeg_stderr(ffmpeg)
+                print(f"[{iso(utc_now())}] ffmpeg stream ended; reconnecting. stderr:\n{err}", file=sys.stderr)
+                stop_ffmpeg(ffmpeg)
+
+                while True:
+                    time.sleep(args.reconnect_delay_seconds)
+                    ffmpeg = start_ffmpeg(args.rtsp)
+                    if ffmpeg.stdout is None:
+                        print(f"[{iso(utc_now())}] ffmpeg restart failed (stdout unavailable), retrying...", file=sys.stderr)
+                        stop_ffmpeg(ffmpeg)
+                        continue
+                    pending.clear()
+                    print(f"[{iso(utc_now())}] ffmpeg reconnected")
+                    break
+                continue
             pending.extend(raw)
 
         while len(pending) >= chunk_bytes:

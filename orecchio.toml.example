@@ -1,0 +1,67 @@
+# Copy to orecchio.toml and adjust per site.
+
+[site]
+id = "backyard-nyc-01"
+timezone = "America/New_York"
+
+[source]
+# provider: avfoundation | rtsp
+provider = "avfoundation"
+device = ":USB Audio CODEC"
+rtsp_url = ""
+sample_rate_hz = 48000
+channels = 1
+ffmpeg_bin = "ffmpeg"
+reconnect_delay_seconds = 3.0
+
+[runtime]
+ring_buffer_seconds = 900
+drop_policy = "drop_oldest_branch_job"
+dump_top = false
+health_report_seconds = 30.0
+
+[branches]
+enabled = ["yamnet", "birdnet"]
+
+[branches.yamnet]
+enabled = true
+sample_rate_hz = 16000
+window_seconds = 5.0
+hop_seconds = 5.0
+top_k = 20
+
+[branches.birdnet]
+enabled = true
+sample_rate_hz = 48000
+window_seconds = 3.0
+hop_seconds = 1.5
+min_confidence = 0.25
+log_zero_detections = false
+lat = 36.95
+lon = -81.08
+# window_start_utc | today_utc | disabled
+date_mode = "window_start_utc"
+ebird_taxonomy_csv = "ebird_taxonomy.csv"
+
+[outputs.local]
+events_csv = "orecchio_events.csv"
+daily_csv = "orecchio_daily_summary.csv"
+detections_jsonl = "orecchio_detections.jsonl"
+
+[outputs.firebase]
+enabled = false
+db_url = ""
+auth_token = ""
+api_key = ""
+refresh_token = ""
+id_token = ""
+service_account = ""
+base_path = "orecchio_sites"
+
+[outputs.birdweather]
+enabled = false
+station_id = ""
+api_token = ""
+require_manual_review = true
+queue_jsonl = "orecchio_birdweather_queue.jsonl"
+sent_jsonl = "orecchio_birdweather_sent.jsonl"

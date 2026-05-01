@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orecchio.local/schemas/orecchio.schema.json",
+  "title": "Orecchio Events Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "detection": {
+      "$ref": "#/$defs/Detection"
+    },
+    "event": {
+      "$ref": "#/$defs/Event"
+    }
+  },
+  "$defs": {
+    "IsoDateTimeUtc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+    },
+    "Detection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "site_id",
+        "source_id",
+        "model",
+        "label",
+        "score",
+        "start_utc",
+        "end_utc"
+      ],
+      "properties": {
+        "site_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "enum": [
+            "yamnet",
+            "birdnet"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "score": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "start_utc": {
+          "$ref": "#/$defs/IsoDateTimeUtc"
+        },
+        "end_utc": {
+          "$ref": "#/$defs/IsoDateTimeUtc"
+        },
+        "metadata": {
+          "type": "object"
+        }
+      }
+    },
+    "Event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "site_id",
+        "event_type",
+        "start_utc",
+        "end_utc",
+        "duration_s",
+        "peak_score"
+      ],
+      "properties": {
+        "site_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "event_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "start_utc": {
+          "$ref": "#/$defs/IsoDateTimeUtc"
+        },
+        "end_utc": {
+          "$ref": "#/$defs/IsoDateTimeUtc"
+        },
+        "duration_s": {
+          "type": "number",
+          "minimum": 0.0
+        },
+        "peak_score": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metadata": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}
